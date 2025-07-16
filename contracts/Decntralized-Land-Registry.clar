@@ -12,6 +12,8 @@
 (define-constant ERR_INVALID_TRANSFER (err u400))
 (define-constant ERR_REGISTRAR_NOT_FOUND (err u405))
 (define-constant ERR_ALREADY_REGISTERED (err u406))
+(define-constant ERR_INVALID_VALUATION (err u407))
+(define-constant ERR_VALUATION_EXISTS (err u408))
 
 ;; data vars
 (define-data-var next-property-id uint u1)
@@ -58,6 +60,29 @@
     resolution: (optional (string-ascii 512))
   })
 
+(define-map property-valuations
+  {property-id: uint, valuation-id: uint}
+  {
+    appraiser: principal,
+    valuation-amount: uint,
+    valuation-date: uint,
+    valuation-type: (string-ascii 32),
+    market-conditions: (string-ascii 128),
+    confidence-score: uint
+  })
+
+(define-map property-valuation-count uint uint)
+
+(define-map property-value-history
+  uint
+  {
+    current-value: uint,
+    previous-value: uint,
+    value-change-percentage: int,
+    last-valuation-date: uint,
+    total-valuations: uint
+  })
+
 ;; public functions
 
 (define-public (register-property 
@@ -83,6 +108,15 @@
         verified: false
       })
     (map-set property-transfer-count property-id u0)
+    (map-set property-valuation-count property-id u0)
+    (map-set property-value-history property-id
+      {
+        current-value: value,
+        previous-value: u0,
+        value-change-percentage: 0,
+        last-valuation-date: current-block,
+        total-valuations: u0
+      })
     (update-owner-properties tx-sender property-id true)
     (var-set next-property-id (+ property-id u1))
     (ok property-id)))
@@ -120,6 +154,7 @@
       })
     
     (map-set property-transfer-count property-id (+ transfer-count u1))
+    (update-property-value-history property-id transfer-value)
     (update-owner-properties current-owner property-id false)
     (update-owner-properties new-owner property-id true)
     (ok true)))
@@ -194,7 +229,54 @@
         value: new-value,
         last-updated: burn-block-height
       }))
+    (update-property-value-history property-id new-value)
     (ok true)))
+
+(define-public (add-property-valuation
+  (property-id uint)
+  (valuation-amount uint)
+  (valuation-type (string-ascii 32))
+  (market-conditions (string-ascii 128))
+  (confidence-score uint))
+  (let 
+    (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (valuation-count (default-to u0 (map-get? property-valuation-count property-id)))
+      (current-block burn-block-height)
+    )
+    (asserts! (is-authorized-registrar tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> valuation-amount u0) ERR_INVALID_VALUATION)
+    (asserts! (<= confidence-score u100) ERR_INVALID_VALUATION)
+    
+    (map-set property-valuations
+      {property-id: property-id, valuation-id: valuation-count}
+      {
+        appraiser: tx-sender,
+        valuation-amount: valuation-amount,
+        valuation-date: current-block,
+        valuation-type: valuation-type,
+        market-conditions: market-conditions,
+        confidence-score: confidence-score
+      })
+    
+    (map-set property-valuation-count property-id (+ valuation-count u1))
+    (update-property-value-history property-id valuation-amount)
+    (ok valuation-count)))
+
+(define-public (get-property-market-trend (property-id uint))
+  (let 
+    (
+      (value-history (unwrap! (map-get? property-value-history property-id) ERR_PROPERTY_NOT_FOUND))
+      (current-value (get current-value value-history))
+      (previous-value (get previous-value value-history))
+      (change-percentage (get value-change-percentage value-history))
+    )
+    (ok {
+      current-value: current-value,
+      previous-value: previous-value,
+      change-percentage: change-percentage,
+      trend: (if (> change-percentage 0) "increasing" (if (< change-percentage 0) "decreasing" "stable"))
+    })))
 
 ;; read-only functions
 
@@ -234,6 +316,32 @@
     actual-owner (is-eq actual-owner claimed-owner)
     false))
 
+(define-read-only (get-property-valuation-history (property-id uint))
+  (let 
+    (
+      (valuation-count (default-to u0 (map-get? property-valuation-count property-id)))
+    )
+    (if (> valuation-count u0)
+      (get-valuation-by-id property-id (- valuation-count u1))
+      none)))
+
+(define-read-only (get-property-value-history (property-id uint))
+  (map-get? property-value-history property-id))
+
+(define-read-only (get-property-valuation-count (property-id uint))
+  (default-to u0 (map-get? property-valuation-count property-id)))
+
+(define-read-only (calculate-property-appreciation (property-id uint))
+  (let 
+    (
+      (value-history (unwrap! (map-get? property-value-history property-id) (err u0)))
+      (current-value (get current-value value-history))
+      (previous-value (get previous-value value-history))
+    )
+    (if (> previous-value u0)
+      (ok (to-int (/ (* (- current-value previous-value) u100) previous-value)))
+      (ok 0))))
+
 ;; private functions
 
 (define-private (update-owner-properties (owner principal) (property-id uint) (add bool))
@@ -247,3 +355,34 @@
 
 (define-private (get-transfer-by-id (property-id uint) (transfer-id uint))
   (map-get? property-transfers {property-id: property-id, transfer-id: transfer-id}))
+
+(define-private (get-valuation-by-id (property-id uint) (valuation-id uint))
+  (map-get? property-valuations {property-id: property-id, valuation-id: valuation-id}))
+
+(define-private (update-property-value-history (property-id uint) (new-value uint))
+  (let 
+    (
+      (current-history (default-to 
+        {
+          current-value: u0,
+          previous-value: u0,
+          value-change-percentage: 0,
+          last-valuation-date: u0,
+          total-valuations: u0
+        }
+        (map-get? property-value-history property-id)))
+      (current-value (get current-value current-history))
+      (total-valuations (get total-valuations current-history))
+      (percentage-change (if (> current-value u0)
+        (to-int (/ (* (- new-value current-value) u100) current-value))
+        0))
+    )
+    (map-set property-value-history property-id
+      {
+        current-value: new-value,
+        previous-value: current-value,
+        value-change-percentage: percentage-change,
+        last-valuation-date: burn-block-height,
+        total-valuations: (+ total-valuations u1)
+      })
+    true))
