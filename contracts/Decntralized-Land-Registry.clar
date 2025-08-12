@@ -14,10 +14,15 @@
 (define-constant ERR_ALREADY_REGISTERED (err u406))
 (define-constant ERR_INVALID_VALUATION (err u407))
 (define-constant ERR_VALUATION_EXISTS (err u408))
+(define-constant ERR_LEASE_NOT_FOUND (err u409))
+(define-constant ERR_LEASE_ACTIVE (err u410))
+(define-constant ERR_LEASE_EXPIRED (err u411))
+(define-constant ERR_INVALID_LEASE_TERMS (err u412))
 
 ;; data vars
 (define-data-var next-property-id uint u1)
 (define-data-var contract-admin principal CONTRACT_OWNER)
+(define-data-var next-lease-id uint u1)
 
 ;; data maps
 (define-map properties 
@@ -82,6 +87,26 @@
     last-valuation-date: uint,
     total-valuations: uint
   })
+
+(define-map property-leases
+  uint
+  {
+    property-id: uint,
+    landlord: principal,
+    tenant: principal,
+    monthly-rent: uint,
+    security-deposit: uint,
+    lease-start: uint,
+    lease-end: uint,
+    lease-status: (string-ascii 16),
+    created-at: uint
+  })
+
+(define-map active-property-leases uint uint)
+
+(define-map tenant-lease-history principal (list 50 uint))
+
+(define-map landlord-lease-history principal (list 100 uint))
 
 ;; public functions
 
@@ -278,6 +303,85 @@
       trend: (if (> change-percentage 0) "increasing" (if (< change-percentage 0) "decreasing" "stable"))
     })))
 
+(define-public (create-lease
+  (property-id uint)
+  (tenant principal)
+  (monthly-rent uint)
+  (security-deposit uint)
+  (lease-duration uint))
+  (let 
+    (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (property-owner (get owner property))
+      (lease-id (var-get next-lease-id))
+      (current-block burn-block-height)
+      (lease-end-block (+ current-block lease-duration))
+      (existing-lease (map-get? active-property-leases property-id))
+    )
+    (asserts! (is-eq tx-sender property-owner) ERR_INVALID_OWNER)
+    (asserts! (is-none existing-lease) ERR_LEASE_ACTIVE)
+    (asserts! (> monthly-rent u0) ERR_INVALID_LEASE_TERMS)
+    (asserts! (> lease-duration u0) ERR_INVALID_LEASE_TERMS)
+    (asserts! (not (is-eq tx-sender tenant)) ERR_INVALID_LEASE_TERMS)
+
+    (map-set property-leases lease-id
+      {
+        property-id: property-id,
+        landlord: tx-sender,
+        tenant: tenant,
+        monthly-rent: monthly-rent,
+        security-deposit: security-deposit,
+        lease-start: current-block,
+        lease-end: lease-end-block,
+        lease-status: "active",
+        created-at: current-block
+      })
+
+    (map-set active-property-leases property-id lease-id)
+    (update-tenant-lease-history tenant lease-id)
+    (update-landlord-lease-history tx-sender lease-id)
+    (var-set next-lease-id (+ lease-id u1))
+    (ok lease-id)))
+
+(define-public (terminate-lease (lease-id uint))
+  (let 
+    (
+      (lease (unwrap! (map-get? property-leases lease-id) ERR_LEASE_NOT_FOUND))
+      (landlord (get landlord lease))
+      (property-id (get property-id lease))
+      (lease-status (get lease-status lease))
+    )
+    (asserts! (is-eq tx-sender landlord) ERR_INVALID_OWNER)
+    (asserts! (is-eq lease-status "active") ERR_LEASE_EXPIRED)
+
+    (map-set property-leases lease-id
+      (merge lease {lease-status: "terminated"}))
+    (map-delete active-property-leases property-id)
+    (ok true)))
+
+(define-public (renew-lease 
+  (lease-id uint)
+  (new-duration uint)
+  (new-rent uint))
+  (let 
+    (
+      (lease (unwrap! (map-get? property-leases lease-id) ERR_LEASE_NOT_FOUND))
+      (landlord (get landlord lease))
+      (current-block burn-block-height)
+      (new-lease-end (+ current-block new-duration))
+    )
+    (asserts! (is-eq tx-sender landlord) ERR_INVALID_OWNER)
+    (asserts! (is-eq (get lease-status lease) "active") ERR_LEASE_EXPIRED)
+    (asserts! (> new-duration u0) ERR_INVALID_LEASE_TERMS)
+    (asserts! (> new-rent u0) ERR_INVALID_LEASE_TERMS)
+
+    (map-set property-leases lease-id
+      (merge lease {
+        lease-end: new-lease-end,
+        monthly-rent: new-rent
+      }))
+    (ok true)))
+
 ;; read-only functions
 
 (define-read-only (get-property (property-id uint))
@@ -342,6 +446,40 @@
       (ok (to-int (/ (* (- current-value previous-value) u100) previous-value)))
       (ok 0))))
 
+(define-read-only (get-lease (lease-id uint))
+  (map-get? property-leases lease-id))
+
+(define-read-only (get-active-lease-by-property (property-id uint))
+  (match (map-get? active-property-leases property-id)
+    lease-id (map-get? property-leases lease-id)
+    none))
+
+(define-read-only (get-tenant-lease-history (tenant principal))
+  (default-to (list) (map-get? tenant-lease-history tenant)))
+
+(define-read-only (get-landlord-lease-history (landlord principal))
+  (default-to (list) (map-get? landlord-lease-history landlord)))
+
+(define-read-only (is-lease-active (lease-id uint))
+  (match (map-get? property-leases lease-id)
+    lease 
+      (and 
+        (is-eq (get lease-status lease) "active")
+        (< burn-block-height (get lease-end lease)))
+    false))
+
+(define-read-only (get-lease-status (property-id uint))
+  (match (get-active-lease-by-property property-id)
+    lease
+      (some {
+        lease-id: (unwrap-panic (map-get? active-property-leases property-id)),
+        tenant: (get tenant lease),
+        monthly-rent: (get monthly-rent lease),
+        lease-end: (get lease-end lease),
+        status: (get lease-status lease)
+      })
+    none))
+
 ;; private functions
 
 (define-private (update-owner-properties (owner principal) (property-id uint) (add bool))
@@ -386,3 +524,19 @@
         total-valuations: (+ total-valuations u1)
       })
     true))
+
+(define-private (update-tenant-lease-history (tenant principal) (lease-id uint))
+  (let 
+    (
+      (current-history (default-to (list) (map-get? tenant-lease-history tenant)))
+    )
+    (map-set tenant-lease-history tenant 
+      (unwrap-panic (as-max-len? (append current-history lease-id) u50)))))
+
+(define-private (update-landlord-lease-history (landlord principal) (lease-id uint))
+  (let 
+    (
+      (current-history (default-to (list) (map-get? landlord-lease-history landlord)))
+    )
+    (map-set landlord-lease-history landlord 
+      (unwrap-panic (as-max-len? (append current-history lease-id) u100)))))
