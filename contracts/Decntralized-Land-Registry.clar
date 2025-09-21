@@ -18,11 +18,21 @@
 (define-constant ERR_LEASE_ACTIVE (err u410))
 (define-constant ERR_LEASE_EXPIRED (err u411))
 (define-constant ERR_INVALID_LEASE_TERMS (err u412))
+(define-constant ERR_INSURANCE_NOT_FOUND (err u413))
+(define-constant ERR_INSURANCE_EXPIRED (err u414))
+(define-constant ERR_CLAIM_NOT_FOUND (err u415))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u416))
+(define-constant ERR_INVALID_PROVIDER (err u417))
+(define-constant ERR_INSUFFICIENT_COVERAGE (err u418))
+(define-constant ERR_INVALID_PREMIUM (err u419))
+(define-constant ERR_POLICY_ACTIVE (err u420))
 
 ;; data vars
 (define-data-var next-property-id uint u1)
 (define-data-var contract-admin principal CONTRACT_OWNER)
 (define-data-var next-lease-id uint u1)
+(define-data-var next-policy-id uint u1)
+(define-data-var next-claim-id uint u1)
 
 ;; data maps
 (define-map properties 
@@ -107,6 +117,43 @@
 (define-map tenant-lease-history principal (list 50 uint))
 
 (define-map landlord-lease-history principal (list 100 uint))
+
+(define-map authorized-insurance-providers principal bool)
+
+(define-map property-insurance-policies
+  uint
+  {
+    policy-id: uint,
+    property-id: uint,
+    policy-holder: principal,
+    insurance-provider: principal,
+    coverage-amount: uint,
+    annual-premium: uint,
+    policy-start: uint,
+    policy-end: uint,
+    coverage-type: (string-ascii 64),
+    policy-status: (string-ascii 16),
+    created-at: uint
+  })
+
+(define-map property-active-policies uint uint)
+
+(define-map insurance-claims
+  uint
+  {
+    policy-id: uint,
+    claimant: principal,
+    claim-amount: uint,
+    incident-date: uint,
+    claim-description: (string-ascii 512),
+    claim-status: (string-ascii 16),
+    filed-at: uint,
+    processed-at: uint,
+    payout-amount: uint,
+    adjuster: (optional principal)
+  })
+
+(define-map policy-claim-history uint (list 20 uint))
 
 ;; public functions
 
@@ -382,6 +429,183 @@
       }))
     (ok true)))
 
+(define-public (authorize-insurance-provider (provider principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (map-set authorized-insurance-providers provider true)
+    (ok true)))
+
+(define-public (revoke-insurance-provider (provider principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (map-delete authorized-insurance-providers provider)
+    (ok true)))
+
+(define-public (purchase-insurance-policy
+  (property-id uint)
+  (insurance-provider principal)
+  (coverage-amount uint)
+  (annual-premium uint)
+  (policy-duration uint)
+  (coverage-type (string-ascii 64)))
+  (let 
+    (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (property-owner (get owner property))
+      (policy-id (var-get next-policy-id))
+      (current-block burn-block-height)
+      (policy-end-block (+ current-block policy-duration))
+      (existing-policy (map-get? property-active-policies property-id))
+    )
+    (asserts! (is-eq tx-sender property-owner) ERR_INVALID_OWNER)
+    (asserts! (is-authorized-insurance-provider insurance-provider) ERR_INVALID_PROVIDER)
+    (asserts! (is-none existing-policy) ERR_POLICY_ACTIVE)
+    (asserts! (> coverage-amount u0) ERR_INVALID_PREMIUM)
+    (asserts! (> annual-premium u0) ERR_INVALID_PREMIUM)
+    (asserts! (> policy-duration u0) ERR_INVALID_LEASE_TERMS)
+
+    (map-set property-insurance-policies policy-id
+      {
+        policy-id: policy-id,
+        property-id: property-id,
+        policy-holder: property-owner,
+        insurance-provider: insurance-provider,
+        coverage-amount: coverage-amount,
+        annual-premium: annual-premium,
+        policy-start: current-block,
+        policy-end: policy-end-block,
+        coverage-type: coverage-type,
+        policy-status: "active",
+        created-at: current-block
+      })
+
+    (map-set property-active-policies property-id policy-id)
+    (map-set policy-claim-history policy-id (list))
+    (var-set next-policy-id (+ policy-id u1))
+    (ok policy-id)))
+
+(define-public (cancel-insurance-policy (policy-id uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? property-insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (policy-holder (get policy-holder policy))
+      (insurance-provider (get insurance-provider policy))
+      (property-id (get property-id policy))
+    )
+    (asserts! (or (is-eq tx-sender policy-holder) (is-eq tx-sender insurance-provider)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get policy-status policy) "active") ERR_INSURANCE_EXPIRED)
+
+    (map-set property-insurance-policies policy-id
+      (merge policy {policy-status: "cancelled"}))
+    (map-delete property-active-policies property-id)
+    (ok true)))
+
+(define-public (renew-insurance-policy 
+  (policy-id uint)
+  (new-duration uint)
+  (new-premium uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? property-insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (insurance-provider (get insurance-provider policy))
+      (current-block burn-block-height)
+      (new-policy-end (+ current-block new-duration))
+    )
+    (asserts! (is-eq tx-sender insurance-provider) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get policy-status policy) "active") ERR_INSURANCE_EXPIRED)
+    (asserts! (> new-duration u0) ERR_INVALID_LEASE_TERMS)
+    (asserts! (> new-premium u0) ERR_INVALID_PREMIUM)
+
+    (map-set property-insurance-policies policy-id
+      (merge policy {
+        policy-end: new-policy-end,
+        annual-premium: new-premium
+      }))
+    (ok true)))
+
+(define-public (file-insurance-claim
+  (policy-id uint)
+  (claim-amount uint)
+  (incident-date uint)
+  (claim-description (string-ascii 512)))
+  (let 
+    (
+      (policy (unwrap! (map-get? property-insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (policy-holder (get policy-holder policy))
+      (coverage-amount (get coverage-amount policy))
+      (claim-id (var-get next-claim-id))
+      (current-block burn-block-height)
+      (claim-history (default-to (list) (map-get? policy-claim-history policy-id)))
+    )
+    (asserts! (is-eq tx-sender policy-holder) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get policy-status policy) "active") ERR_INSURANCE_EXPIRED)
+    (asserts! (< current-block (get policy-end policy)) ERR_INSURANCE_EXPIRED)
+    (asserts! (<= claim-amount coverage-amount) ERR_INSUFFICIENT_COVERAGE)
+    (asserts! (> claim-amount u0) ERR_INVALID_PREMIUM)
+    (asserts! (<= incident-date current-block) ERR_INVALID_LEASE_TERMS)
+
+    (map-set insurance-claims claim-id
+      {
+        policy-id: policy-id,
+        claimant: tx-sender,
+        claim-amount: claim-amount,
+        incident-date: incident-date,
+        claim-description: claim-description,
+        claim-status: "pending",
+        filed-at: current-block,
+        processed-at: u0,
+        payout-amount: u0,
+        adjuster: none
+      })
+
+    (map-set policy-claim-history policy-id
+      (unwrap-panic (as-max-len? (append claim-history claim-id) u20)))
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)))
+
+(define-public (process-insurance-claim 
+  (claim-id uint)
+  (approved bool)
+  (payout-amount uint))
+  (let 
+    (
+      (claim (unwrap! (map-get? insurance-claims claim-id) ERR_CLAIM_NOT_FOUND))
+      (policy-id (get policy-id claim))
+      (policy (unwrap! (map-get? property-insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (insurance-provider (get insurance-provider policy))
+      (current-block burn-block-height)
+    )
+    (asserts! (is-eq tx-sender insurance-provider) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get claim-status claim) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (<= payout-amount (get claim-amount claim)) ERR_INSUFFICIENT_COVERAGE)
+
+    (map-set insurance-claims claim-id
+      (merge claim {
+        claim-status: (if approved "approved" "denied"),
+        processed-at: current-block,
+        payout-amount: (if approved payout-amount u0),
+        adjuster: (some tx-sender)
+      }))
+    (ok true)))
+
+(define-public (investigate-claim (claim-id uint) (adjuster principal))
+  (let 
+    (
+      (claim (unwrap! (map-get? insurance-claims claim-id) ERR_CLAIM_NOT_FOUND))
+      (policy-id (get policy-id claim))
+      (policy (unwrap! (map-get? property-insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (insurance-provider (get insurance-provider policy))
+    )
+    (asserts! (is-eq tx-sender insurance-provider) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get claim-status claim) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+
+    (map-set insurance-claims claim-id
+      (merge claim {
+        claim-status: "investigating",
+        adjuster: (some adjuster)
+      }))
+    (ok true)))
+
 ;; read-only functions
 
 (define-read-only (get-property (property-id uint))
@@ -476,7 +700,59 @@
         tenant: (get tenant lease),
         monthly-rent: (get monthly-rent lease),
         lease-end: (get lease-end lease),
-        status: (get lease-status lease)
+      status: (get lease-status lease)
+      })
+    none))
+
+(define-read-only (get-insurance-policy (policy-id uint))
+  (map-get? property-insurance-policies policy-id))
+
+(define-read-only (get-property-insurance (property-id uint))
+  (match (map-get? property-active-policies property-id)
+    policy-id (map-get? property-insurance-policies policy-id)
+    none))
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims claim-id))
+
+(define-read-only (get-policy-claims (policy-id uint))
+  (default-to (list) (map-get? policy-claim-history policy-id)))
+
+(define-read-only (is-authorized-insurance-provider (provider principal))
+  (default-to false (map-get? authorized-insurance-providers provider)))
+
+(define-read-only (is-policy-active (policy-id uint))
+  (match (map-get? property-insurance-policies policy-id)
+    policy 
+      (and 
+        (is-eq (get policy-status policy) "active")
+        (< burn-block-height (get policy-end policy)))
+    false))
+
+(define-read-only (calculate-insurance-premium-due (policy-id uint))
+  (match (map-get? property-insurance-policies policy-id)
+    policy
+      (let 
+        (
+          (annual-premium (get annual-premium policy))
+          (policy-start (get policy-start policy))
+          (current-block burn-block-height)
+          (blocks-elapsed (- current-block policy-start))
+          (yearly-blocks u52560)
+        )
+        (ok (/ (* annual-premium blocks-elapsed) yearly-blocks)))
+    ERR_INSURANCE_NOT_FOUND))
+
+(define-read-only (get-property-insurance-status (property-id uint))
+  (match (get-property-insurance property-id)
+    insurance-policy
+      (some {
+        policy-id: (get policy-id insurance-policy),
+        coverage-amount: (get coverage-amount insurance-policy),
+        annual-premium: (get annual-premium insurance-policy),
+        policy-end: (get policy-end insurance-policy),
+        coverage-type: (get coverage-type insurance-policy),
+        is-active: (is-policy-active (get policy-id insurance-policy))
       })
     none))
 
