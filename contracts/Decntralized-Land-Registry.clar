@@ -26,6 +26,15 @@
 (define-constant ERR_INSUFFICIENT_COVERAGE (err u418))
 (define-constant ERR_INVALID_PREMIUM (err u419))
 (define-constant ERR_POLICY_ACTIVE (err u420))
+(define-constant ERR_NOT_CO_OWNER (err u421))
+(define-constant ERR_INVALID_SHARE_PERCENTAGE (err u422))
+(define-constant ERR_SHARES_EXCEED_100 (err u423))
+(define-constant ERR_CO_OWNERSHIP_EXISTS (err u424))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u425))
+(define-constant ERR_ALREADY_VOTED (err u426))
+(define-constant ERR_PROPOSAL_EXECUTED (err u427))
+(define-constant ERR_INSUFFICIENT_VOTES (err u428))
+(define-constant ERR_INVALID_SHARE_TRANSFER (err u429))
 
 ;; data vars
 (define-data-var next-property-id uint u1)
@@ -33,6 +42,7 @@
 (define-data-var next-lease-id uint u1)
 (define-data-var next-policy-id uint u1)
 (define-data-var next-claim-id uint u1)
+(define-data-var next-proposal-id uint u1)
 
 ;; data maps
 (define-map properties 
@@ -154,6 +164,43 @@
   })
 
 (define-map policy-claim-history uint (list 20 uint))
+
+(define-map property-co-ownership
+  {property-id: uint, co-owner: principal}
+  {
+    share-percentage: uint,
+    added-at: uint,
+    is-active: bool
+  })
+
+(define-map property-co-owners
+  uint
+  {co-owners: (list 20 principal), total-shares: uint})
+
+(define-map co-ownership-proposals
+  uint
+  {
+    property-id: uint,
+    proposer: principal,
+    proposal-type: (string-ascii 32),
+    description: (string-ascii 256),
+    target-principal: (optional principal),
+    target-value: uint,
+    votes-for: uint,
+    votes-against: uint,
+    required-percentage: uint,
+    created-at: uint,
+    executed: bool,
+    execution-deadline: uint
+  })
+
+(define-map proposal-votes
+  {proposal-id: uint, voter: principal}
+  {vote: bool, voting-power: uint})
+
+(define-map property-proposal-history
+  uint
+  (list 50 uint))
 
 ;; public functions
 
@@ -816,3 +863,245 @@
     )
     (map-set landlord-lease-history landlord 
       (unwrap-panic (as-max-len? (append current-history lease-id) u100)))))
+
+(define-public (create-co-ownership
+  (property-id uint)
+  (co-owners-list (list 20 {owner: principal, share: uint})))
+  (let 
+    (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (property-owner (get owner property))
+      (total-shares (fold sum-shares co-owners-list u0))
+      (co-owner-principals (map extract-principal co-owners-list))
+    )
+    (asserts! (is-eq tx-sender property-owner) ERR_INVALID_OWNER)
+    (asserts! (is-none (map-get? property-co-owners property-id)) ERR_CO_OWNERSHIP_EXISTS)
+    (asserts! (is-eq total-shares u10000) ERR_SHARES_EXCEED_100)
+    (asserts! (> (len co-owners-list) u0) ERR_INVALID_SHARE_PERCENTAGE)
+    
+    (fold setup-co-owner co-owners-list {property-id: property-id, success: true})
+    
+    (map-set property-co-owners property-id
+      {co-owners: co-owner-principals, total-shares: total-shares})
+    
+    (map-set property-proposal-history property-id (list))
+    (ok true)))
+
+(define-public (transfer-ownership-share
+  (property-id uint)
+  (new-owner principal)
+  (share-percentage uint))
+  (let 
+    (
+      (co-ownership (unwrap! (map-get? property-co-ownership {property-id: property-id, co-owner: tx-sender}) ERR_NOT_CO_OWNER))
+      (current-share (get share-percentage co-ownership))
+      (current-block burn-block-height)
+    )
+    (asserts! (get is-active co-ownership) ERR_NOT_CO_OWNER)
+    (asserts! (<= share-percentage current-share) ERR_INVALID_SHARE_TRANSFER)
+    (asserts! (> share-percentage u0) ERR_INVALID_SHARE_PERCENTAGE)
+    (asserts! (not (is-eq tx-sender new-owner)) ERR_INVALID_TRANSFER)
+    
+    (if (is-eq share-percentage current-share)
+      (begin
+        (map-set property-co-ownership {property-id: property-id, co-owner: tx-sender}
+          (merge co-ownership {is-active: false}))
+        (map-set property-co-ownership {property-id: property-id, co-owner: new-owner}
+          {
+            share-percentage: share-percentage,
+            added-at: current-block,
+            is-active: true
+          })
+        (update-co-owners-list property-id tx-sender new-owner))
+      (begin
+        (map-set property-co-ownership {property-id: property-id, co-owner: tx-sender}
+          (merge co-ownership {share-percentage: (- current-share share-percentage)}))
+        (map-set property-co-ownership {property-id: property-id, co-owner: new-owner}
+          {
+            share-percentage: share-percentage,
+            added-at: current-block,
+            is-active: true
+          })
+        (add-co-owner-to-list property-id new-owner)))
+    (ok true)))
+
+(define-public (create-co-ownership-proposal
+  (property-id uint)
+  (proposal-type (string-ascii 32))
+  (description (string-ascii 256))
+  (target-principal (optional principal))
+  (target-value uint)
+  (execution-deadline uint))
+  (let 
+    (
+      (co-ownership (unwrap! (map-get? property-co-ownership {property-id: property-id, co-owner: tx-sender}) ERR_NOT_CO_OWNER))
+      (proposal-id (var-get next-proposal-id))
+      (current-block burn-block-height)
+    )
+    (asserts! (get is-active co-ownership) ERR_NOT_CO_OWNER)
+    (asserts! (> execution-deadline current-block) ERR_INVALID_LEASE_TERMS)
+    
+    (map-set co-ownership-proposals proposal-id
+      {
+        property-id: property-id,
+        proposer: tx-sender,
+        proposal-type: proposal-type,
+        description: description,
+        target-principal: target-principal,
+        target-value: target-value,
+        votes-for: u0,
+        votes-against: u0,
+        required-percentage: u6700,
+        created-at: current-block,
+        executed: false,
+        execution-deadline: execution-deadline
+      })
+    
+    (let 
+      (
+        (proposal-history (default-to (list) (map-get? property-proposal-history property-id)))
+      )
+      (map-set property-proposal-history property-id
+        (unwrap-panic (as-max-len? (append proposal-history proposal-id) u50))))
+    
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)))
+
+(define-public (vote-on-proposal
+  (proposal-id uint)
+  (vote-for bool))
+  (let 
+    (
+      (proposal (unwrap! (map-get? co-ownership-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (property-id (get property-id proposal))
+      (co-ownership (unwrap! (map-get? property-co-ownership {property-id: property-id, co-owner: tx-sender}) ERR_NOT_CO_OWNER))
+      (voting-power (get share-percentage co-ownership))
+      (current-block burn-block-height)
+    )
+    (asserts! (get is-active co-ownership) ERR_NOT_CO_OWNER)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_EXECUTED)
+    (asserts! (< current-block (get execution-deadline proposal)) ERR_LEASE_EXPIRED)
+    (asserts! (is-none (map-get? proposal-votes {proposal-id: proposal-id, voter: tx-sender})) ERR_ALREADY_VOTED)
+    
+    (map-set proposal-votes {proposal-id: proposal-id, voter: tx-sender}
+      {vote: vote-for, voting-power: voting-power})
+    
+    (if vote-for
+      (map-set co-ownership-proposals proposal-id
+        (merge proposal {votes-for: (+ (get votes-for proposal) voting-power)}))
+      (map-set co-ownership-proposals proposal-id
+        (merge proposal {votes-against: (+ (get votes-against proposal) voting-power)})))
+    (ok true)))
+
+(define-public (execute-co-ownership-proposal (proposal-id uint))
+  (let 
+    (
+      (proposal (unwrap! (map-get? co-ownership-proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (property-id (get property-id proposal))
+      (co-ownership (unwrap! (map-get? property-co-ownership {property-id: property-id, co-owner: tx-sender}) ERR_NOT_CO_OWNER))
+      (votes-for (get votes-for proposal))
+      (total-votes (+ votes-for (get votes-against proposal)))
+      (required-percentage (get required-percentage proposal))
+      (current-block burn-block-height)
+    )
+    (asserts! (get is-active co-ownership) ERR_NOT_CO_OWNER)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_EXECUTED)
+    (asserts! (>= current-block (get execution-deadline proposal)) ERR_PROPOSAL_EXECUTED)
+    (asserts! (>= (* votes-for u100) (* total-votes (/ required-percentage u100))) ERR_INSUFFICIENT_VOTES)
+    
+    (map-set co-ownership-proposals proposal-id
+      (merge proposal {executed: true}))
+    (ok true)))
+
+(define-read-only (get-co-ownership-info (property-id uint))
+  (map-get? property-co-owners property-id))
+
+(define-read-only (get-co-owner-share (property-id uint) (co-owner principal))
+  (map-get? property-co-ownership {property-id: property-id, co-owner: co-owner}))
+
+(define-read-only (get-co-ownership-proposal (proposal-id uint))
+  (map-get? co-ownership-proposals proposal-id))
+
+(define-read-only (get-proposal-vote (proposal-id uint) (voter principal))
+  (map-get? proposal-votes {proposal-id: proposal-id, voter: voter}))
+
+(define-read-only (get-property-proposals (property-id uint))
+  (default-to (list) (map-get? property-proposal-history property-id)))
+
+(define-read-only (is-co-owner (property-id uint) (potential-owner principal))
+  (match (map-get? property-co-ownership {property-id: property-id, co-owner: potential-owner})
+    ownership (get is-active ownership)
+    false))
+
+(define-read-only (calculate-proposal-status (proposal-id uint))
+  (match (map-get? co-ownership-proposals proposal-id)
+    proposal
+      (let 
+        (
+          (votes-for (get votes-for proposal))
+          (votes-against (get votes-against proposal))
+          (total-votes (+ votes-for votes-against))
+          (required-percentage (get required-percentage proposal))
+          (current-block burn-block-height)
+          (is-expired (>= current-block (get execution-deadline proposal)))
+        )
+        (ok {
+          votes-for: votes-for,
+          votes-against: votes-against,
+          total-votes: total-votes,
+          approval-rate: (if (> total-votes u0) (/ (* votes-for u10000) total-votes) u0),
+          is-passing: (>= (* votes-for u100) (* total-votes (/ required-percentage u100))),
+          is-executed: (get executed proposal),
+          is-expired: is-expired
+        }))
+    ERR_PROPOSAL_NOT_FOUND))
+
+(define-private (sum-shares (co-owner-data {owner: principal, share: uint}) (total uint))
+  (+ total (get share co-owner-data)))
+
+(define-private (extract-principal (co-owner-data {owner: principal, share: uint}))
+  (get owner co-owner-data))
+
+(define-private (setup-co-owner (co-owner-data {owner: principal, share: uint}) (context {property-id: uint, success: bool}))
+  (let 
+    (
+      (property-id (get property-id context))
+      (owner (get owner co-owner-data))
+      (share (get share co-owner-data))
+      (current-block burn-block-height)
+    )
+    (begin
+      (map-set property-co-ownership {property-id: property-id, co-owner: owner}
+        {
+          share-percentage: share,
+          added-at: current-block,
+          is-active: true
+        })
+      context)))
+
+(define-private (update-co-owners-list (property-id uint) (old-owner principal) (new-owner principal))
+  (let 
+    (
+      (co-owners-data (unwrap-panic (map-get? property-co-owners property-id)))
+      (current-owners (get co-owners co-owners-data))
+      (filtered-result (fold filter-old-owner current-owners {target: old-owner, result: (list)}))
+      (filtered-owners (get result filtered-result))
+    )
+    (map-set property-co-owners property-id
+      (merge co-owners-data {co-owners: (unwrap-panic (as-max-len? (append filtered-owners new-owner) u20))}))))
+
+(define-private (filter-old-owner (owner principal) (acc {target: principal, result: (list 20 principal)}))
+  (if (is-eq owner (get target acc))
+    acc
+    (merge acc {result: (unwrap-panic (as-max-len? (append (get result acc) owner) u20))})))
+
+(define-private (add-co-owner-to-list (property-id uint) (new-owner principal))
+  (let 
+    (
+      (co-owners-data (unwrap-panic (map-get? property-co-owners property-id)))
+      (current-owners (get co-owners co-owners-data))
+    )
+    (if (is-none (index-of current-owners new-owner))
+      (map-set property-co-owners property-id
+        (merge co-owners-data {co-owners: (unwrap-panic (as-max-len? (append current-owners new-owner) u20))}))
+      true)))
