@@ -35,6 +35,10 @@
 (define-constant ERR_PROPOSAL_EXECUTED (err u427))
 (define-constant ERR_INSUFFICIENT_VOTES (err u428))
 (define-constant ERR_INVALID_SHARE_TRANSFER (err u429))
+(define-constant ERR_LISTING_NOT_FOUND (err u430))
+(define-constant ERR_PRICE_MUST_BE_POSITIVE (err u431))
+(define-constant ERR_ALREADY_LISTED (err u432))
+(define-constant ERR_PAYMENT_FAILED (err u433))
 
 ;; data vars
 (define-data-var next-property-id uint u1)
@@ -201,6 +205,14 @@
 (define-map property-proposal-history
   uint
   (list 50 uint))
+
+(define-map property-listings
+  uint
+  {
+    seller: principal,
+    price: uint,
+    listed-at: uint
+  })
 
 ;; public functions
 
@@ -1013,6 +1025,79 @@
       (merge proposal {executed: true}))
     (ok true)))
 
+(define-public (list-property (property-id uint) (price uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (owner (get owner property))
+    )
+    (asserts! (is-eq tx-sender owner) ERR_INVALID_OWNER)
+    (asserts! (> price u0) ERR_PRICE_MUST_BE_POSITIVE)
+    (asserts! (is-none (map-get? property-listings property-id)) ERR_ALREADY_LISTED)
+
+    (map-set property-listings property-id
+      {
+        seller: tx-sender,
+        price: price,
+        listed-at: burn-block-height
+      })
+    (ok true)))
+
+(define-public (unlist-property (property-id uint))
+  (let
+    (
+      (listing (unwrap! (map-get? property-listings property-id) ERR_LISTING_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get seller listing)) ERR_UNAUTHORIZED)
+    (map-delete property-listings property-id)
+    (ok true)))
+
+(define-public (purchase-property (property-id uint))
+  (let
+    (
+      (listing (unwrap! (map-get? property-listings property-id) ERR_LISTING_NOT_FOUND))
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+      (seller (get seller listing))
+      (price (get price listing))
+      (buyer tx-sender)
+      (current-owner (get owner property))
+      (transfer-count (default-to u0 (map-get? property-transfer-count property-id)))
+      (current-block burn-block-height)
+    )
+    ;; Verify seller is still owner
+    (asserts! (is-eq seller current-owner) ERR_INVALID_OWNER)
+    (asserts! (not (is-eq buyer seller)) ERR_INVALID_TRANSFER)
+
+    ;; Transfer STX
+    (unwrap! (stx-transfer? price buyer seller) ERR_PAYMENT_FAILED)
+
+    ;; Transfer Property Ownership
+    (map-set properties property-id
+      (merge property {
+        owner: buyer,
+        last-updated: current-block,
+        value: price
+      }))
+
+    (map-set property-transfers
+      {property-id: property-id, transfer-id: transfer-count}
+      {
+        from: seller,
+        to: buyer,
+        transfer-date: current-block,
+        transfer-value: price,
+        transfer-type: "market-sale"
+      })
+
+    (map-set property-transfer-count property-id (+ transfer-count u1))
+    (update-property-value-history property-id price)
+    (update-owner-properties seller property-id false)
+    (update-owner-properties buyer property-id true)
+
+    ;; Remove listing
+    (map-delete property-listings property-id)
+    (ok true)))
+
 (define-read-only (get-co-ownership-info (property-id uint))
   (map-get? property-co-owners property-id))
 
@@ -1055,6 +1140,9 @@
           is-expired: is-expired
         }))
     ERR_PROPOSAL_NOT_FOUND))
+
+(define-read-only (get-listing (property-id uint))
+  (map-get? property-listings property-id))
 
 (define-private (sum-shares (co-owner-data {owner: principal, share: uint}) (total uint))
   (+ total (get share co-owner-data)))
